@@ -96,10 +96,10 @@ var (
 func initDB(){
 	cfg := mysql.Config {
 		User: "root",
-		Passwd: "",
+		Passwd: "Webilor1994@..",
 		Net: "tcp",
-		Addr: "localhost:3306",
-		DBName: "cherrysocket",
+		Addr: "44.212.55.241:3306",
+		DBName: "cherryio",
 		AllowNativePasswords: true,
 	}
 	var err error

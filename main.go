@@ -14,6 +14,9 @@ import (
 	"net/http"
 	"sync"
 	"time"
+	"os"
+    "os/signal"
+    "syscall"
 	"github.com/go-sql-driver/mysql"
 	"github.com/gorilla/mux"
 	"github.com/gorilla/websocket"
@@ -745,6 +748,14 @@ func main() {
 	// if err != nil {
 	// 	log.Fatal("ListenAndServe: ", err)
 	// }
+
+	 // Signal handling
+	 quit := make(chan os.Signal, 1)
+	 signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
+	 <-quit
+ 
+	 // Graceful shutdown logic here...
+	 os.Exit(0)
 }
 
 func generateRandomString(n int) string {

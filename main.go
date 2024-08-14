@@ -712,6 +712,10 @@ func main() {
 	r.HandleFunc("/hello", func(w http.ResponseWriter, r *http.Request){
 		w.Write([]byte("Hello world"));
 	}).Methods("GET")
+	r.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		json.NewEncoder(w).Encode(map[string]string{"status": "OK"})
+	})
 	r.HandleFunc("/auth", func(w http.ResponseWriter, r *http.Request) {
         // Set CORS headers
         w.Header().Set("Access-Control-Allow-Origin", "*") 

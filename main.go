@@ -454,7 +454,12 @@ func handleConnections(w http.ResponseWriter, r *http.Request) {
 			log.Printf("Error reading message: %v", err)
 			break
 		}
-		handleMessage(client, msg, r)
+		if action, ok := msg["action"].(string); ok && action == "unsubscribe" {
+			if channelName, ok := msg["channel"].(string); ok {
+				unsubscribeFromChannel(client, channelName)
+			}
+		}
+		
 
 		if action, ok := msg["action"].(string); ok && action == "subscribe" {
 			if channelName, ok := msg["channel"].(string); ok {
@@ -585,55 +590,39 @@ func subscribeToChannel(client *Client, channelName string, r *http.Request) {
 
 // Unscribe from channel
 func unsubscribeFromChannel(client *Client, channelName string) {
-	channel, exists := channels[channelName]
-	if !exists {
-		return 
-	}
+    channel, exists := channels[channelName]
+    if !exists {
+        return
+    }
 
-	channel.mutex.Lock()
-	defer channel.mutex.Unlock()
+    channel.mutex.Lock()
+    defer channel.mutex.Unlock()
 
-	if _, subscribed := channel.clients[client]; subscribed {
-		delete(channel.clients, client)
-	}
+    // Remove the client from the channel, even if they are not subscribed
+    delete(channel.clients, client)
 
-	clientStillSubscribed := false
-	for _, ch := range channels {
-		if _, subscribed := ch.clients[client]; subscribed {
-			clientStillSubscribed = true
-			break
-		}
-	}
+    // Check if the client is still subscribed to any channels
+    clientStillSubscribed := false
+    for chName := range channels {
+        ch := channels[chName]
+        ch.mutex.Lock()
+        if _, subscribed := ch.clients[client]; subscribed {
+            clientStillSubscribed = true
+        }
+        ch.mutex.Unlock()
 
-	if !clientStillSubscribed {
-		client.conn.Close()
-	}
+        if clientStillSubscribed {
+            break
+        }
+    }
+
+    // If the client is not subscribed to any channels, close their connection
+    if !clientStillSubscribed {
+        client.conn.Close()
+    }
 }
 
-func handleMessage(client *Client, msg map[string]interface{}, r *http.Request) {
-	if action, ok := msg["action"].(string); ok {
-		switch action {
-		case "subscribe":
-			if channelName, ok := msg["channel"].(string); ok {
-				subscribeToChannel(client, channelName, r)
-			}
-		case "unsubscribe":
-			if channelName, ok := msg["channel"].(string); ok {
-				unsubscribeFromChannel(client, channelName)
-			}
-		case "message":
-			if channelName, ok := msg["channel"].(string); ok {
-				if channel, exists := channels[channelName]; exists {
-					channel.broadcast <- msg
-				}
-			}
-		default:
-			log.Printf("Unknown action: %v", action)
-		}
-	} else {
-		log.Println("Received message without action")
-	}
-}
+
 
 
 

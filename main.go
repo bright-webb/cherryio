@@ -454,6 +454,7 @@ func handleConnections(w http.ResponseWriter, r *http.Request) {
 			log.Printf("Error reading message: %v", err)
 			break
 		}
+		handleMessage(client, msg, r)
 
 		if action, ok := msg["action"].(string); ok && action == "subscribe" {
 			if channelName, ok := msg["channel"].(string); ok {
@@ -580,6 +581,60 @@ func subscribeToChannel(client *Client, channelName string, r *http.Request) {
 
 	fmt.Printf("Client subscribed to channel: %s\n", channelName)
 }
+
+
+// Unscribe from channel
+func unsubscribeFromChannel(client *Client, channelName string) {
+	channel, exists := channels[channelName]
+	if !exists {
+		return 
+	}
+
+	channel.mutex.Lock()
+	defer channel.mutex.Unlock()
+
+	if _, subscribed := channel.clients[client]; subscribed {
+		delete(channel.clients, client)
+	}
+
+	clientStillSubscribed := false
+	for _, ch := range channels {
+		if _, subscribed := ch.clients[client]; subscribed {
+			clientStillSubscribed = true
+			break
+		}
+	}
+
+	if !clientStillSubscribed {
+		client.conn.Close()
+	}
+}
+
+func handleMessage(client *Client, msg map[string]interface{}, r *http.Request) {
+	if action, ok := msg["action"].(string); ok {
+		switch action {
+		case "subscribe":
+			if channelName, ok := msg["channel"].(string); ok {
+				subscribeToChannel(client, channelName, r)
+			}
+		case "unsubscribe":
+			if channelName, ok := msg["channel"].(string); ok {
+				unsubscribeFromChannel(client, channelName)
+			}
+		case "message":
+			if channelName, ok := msg["channel"].(string); ok {
+				if channel, exists := channels[channelName]; exists {
+					channel.broadcast <- msg
+				}
+			}
+		default:
+			log.Printf("Unknown action: %v", action)
+		}
+	} else {
+		log.Println("Received message without action")
+	}
+}
+
 
 
 // Broadcast a message to all clients in a channel

@@ -13,6 +13,7 @@ import (
 	"math/rand"
 	"net/http"
 	"sync"
+	"strconv"
 	"time"
 	"os"
     "os/signal"
@@ -22,20 +23,46 @@ import (
 	"github.com/gorilla/websocket"
 	"golang.org/x/time/rate"
 	"github.com/dgrijalva/jwt-go"
+	 "github.com/go-redis/redis/v8"
+    "context"
 )
 
+var (
+	db *sql.DB
+	clients  = make(map[*Client]bool)
+	connectedClient = make(map[int]*Client)
+	channels = make(map[string]*PresenceChannel)
+	upgrader = websocket.Upgrader{
+		ReadBufferSize:  1024,
+		WriteBufferSize: 1024,
+		CheckOrigin: func(r *http.Request) bool {
+			return true
+		},
+	}
+	userChannels = make(map[int]string)
+	idCount int;
+)
 
-var rateLimits = map[string]int{
-	"free": 200,
-	"basic": 700,
-	"standard": 1500,
-	"business": -1, // Unlimited
-}
+var websocketClients = make(map[*websocket.Conn]bool)
+var redisClient *redis.Client
 
 var (
 	privateKey *ecdsa.PrivateKey
 	publicKey  *ecdsa.PublicKey
 )
+
+var ctx = context.Background()
+
+// Initialize Redis client
+var rdb = redis.NewClient(&redis.Options{
+    Addr: "localhost:6379", 
+})
+
+type UserCache struct {
+    UserID           int    `json:"user_id"`
+    UserTier         string `json:"user_tier"`
+    ConnectionsToday int    `json:"connections_today"`
+}
 
 func init() {
 	var err error
@@ -54,8 +81,7 @@ var mutex = sync.Mutex{}
 type Client struct {
 	conn    *websocket.Conn
 	channel string
-	apiKey string
-	secretKey string
+	id int
 	userID int
 }
 
@@ -75,34 +101,23 @@ type Channel struct {
 type PresenceChannel struct {
 	Channel
 	presenceUpdates chan map[string]interface{}
+	pubsub           *redis.PubSub
 }
 
 // RateLimiter
 var rateLimiters = make(map[string]*rate.Limiter)
 var rateLimiterMutex sync.Mutex
 
-var (
-	db *sql.DB
-	clients  = make(map[*Client]bool)
-	channels = make(map[string]*PresenceChannel)
-	upgrader = websocket.Upgrader{
-		ReadBufferSize:  1024,
-		WriteBufferSize: 1024,
-		CheckOrigin: func(r *http.Request) bool {
-			return true
-		},
-	}
-)
 
 
 // Initialize MySQL connection
 func initDB(){
 	cfg := mysql.Config {
 		User: "root",
-		Passwd: "Webilor1994@..",
+		Passwd: "",
 		Net: "tcp",
-		Addr: "44.212.55.241:3306",
-		DBName: "cherryio",
+		Addr: "127.0.0.1:3306",
+		DBName: "cherrysocket",
 		AllowNativePasswords: true,
 	}
 	var err error
@@ -117,7 +132,52 @@ func initDB(){
 	}
 }
 
-// Validate API key and Secret key
+func cacheAPIKey(apiKey string, secret string) {
+    // Cache the secret with an expiration time (e.g., 1 hour)
+    err := redisClient.Set(ctx, "api_key:"+apiKey, secret, time.Hour).Err()
+    if err != nil {
+        log.Printf("Error caching API key: %v", err)
+    }
+}
+
+func getAPIKeyFromCache(apiKey string) (string, bool) {
+    secret, err := redisClient.Get(ctx, "api_key:"+apiKey).Result()
+    if err == redis.Nil {
+        return "", false // key not found
+    } else if err != nil {
+        log.Printf("Error getting API key from Redis: %v", err)
+        return "", false
+    }
+
+    return secret, true
+}
+
+// Add user to a presence channel
+func addUserToPresenceChannel(userID, channelName string) {
+    err := redisClient.SAdd(ctx, "presence:"+channelName, userID).Err()
+    if err != nil {
+        log.Printf("Error adding user to presence channel: %v", err)
+    }
+}
+
+// Remove user from a presence channel
+func removeUserFromPresenceChannel(userID, channelName string) {
+    err := redisClient.SRem(ctx, "presence:"+channelName, userID).Err()
+    if err != nil {
+        log.Printf("Error removing user from presence channel: %v", err)
+    }
+}
+
+// Get all users in a presence channel
+func getUsersInPresenceChannel(channelName string) ([]string, error) {
+    users, err := redisClient.SMembers(ctx, "presence:"+channelName).Result()
+    if err != nil {
+        return nil, err
+    }
+    return users, nil
+}
+
+
 func validateAPIKey(r *http.Request) (int, bool) {
     apiKey := r.Header.Get("X-API-KEY")
     secretKey := r.Header.Get("X-SECRET-KEY")
@@ -125,16 +185,35 @@ func validateAPIKey(r *http.Request) (int, bool) {
         return 0, false
     }
 
-	var userID int
+    // Check Redis cache
+    cacheKey := "auth:" + apiKey + ":" + secretKey
+    cachedUserID, err := rdb.Get(ctx, cacheKey).Result()
+    if err == nil {
+        // Cache hit, return the cached user ID
+        userID, err := strconv.Atoi(cachedUserID)
+        if err == nil {
+            return userID, true
+        }
+    }
+
+    // Cache miss, query the database
+    var userID int
     query := "SELECT id FROM users WHERE api_key=? AND secret_key=?"
-    err := db.QueryRow(query, apiKey, secretKey).Scan(&userID)
+    err = db.QueryRow(query, apiKey, secretKey).Scan(&userID)
     if err != nil {
         log.Println("Error querying database: ", err)
         return 0, false
     }
 
+    // Store the result in Redis
+    err = rdb.Set(ctx, cacheKey, userID, 0).Err()
+    if err != nil {
+        log.Println("Error setting cache: ", err)
+    }
+
     return userID, true
 }
+
 
 func handleAuth(w http.ResponseWriter, r *http.Request) {
 	userID, isValid := validateAPIKey(r)
@@ -151,7 +230,7 @@ func handleAuth(w http.ResponseWriter, r *http.Request) {
 		},
 	}
 	token := jwt.NewWithClaims(jwt.SigningMethodES256, claims)
-	tokenString, err := token.SignedString(privateKey) // Sign with ECDSA private key
+	tokenString, err := token.SignedString(privateKey)
 
 	if err != nil {
 		http.Error(w, "Could not generate token", http.StatusInternalServerError)
@@ -207,19 +286,6 @@ func validateToken(tokenString string) (jwt.MapClaims, error) {
 }
 
 
-
-func generateKeys(user string) (string, string, error){
-	apiKey := generateRandomString(32)
-	secretKey := generateRandomString(64)
-
-	// Save to database
-	_, err := db.Exec("INSERT INTO users (user, api_key, secret_key) VALUES(?, ?, ?)", user, apiKey, secretKey)
-	if err != nil{
-		return "", "", err
-	}
-	return apiKey, secretKey, nil
-}
-
 func createKeysHandler(w http.ResponseWriter, r *http.Request){
 	var req map[string]string
 	err := json.NewDecoder(r.Body).Decode(&req)
@@ -274,6 +340,76 @@ func getKeysHandler(w http.ResponseWriter, r *http.Request){
 	json.NewEncoder(w).Encode(resp)
 }
 
+func handleRedisMessages(channelName string) {
+    pubsub := rdb.Subscribe(ctx, channelName)
+    defer pubsub.Close()
+
+    ch := pubsub.Channel()
+
+    for msg := range ch {
+        var message map[string]interface{}
+        if err := json.Unmarshal([]byte(msg.Payload), &message); err != nil {
+            log.Printf("Error unmarshalling message: %v", err)
+            continue
+        }
+
+        // Broadcast to all clients in the channel
+        if channel, ok := channels[channelName]; ok {
+            channel.mutex.Lock()
+            for client := range channel.clients {
+                if client.conn != nil {
+                    if err := client.conn.WriteJSON(message); err != nil {
+                        log.Printf("Error sending message to client %d: %v", client.userID, err)
+                    }
+                }
+            }
+            channel.mutex.Unlock()
+        }
+    }
+}
+
+
+func broadcastToClients(channelName string, message map[string]interface{}) {
+    mutex.Lock()
+    presenceChannel, ok := channels[channelName]
+    mutex.Unlock()
+
+    if !ok {
+        log.Printf("Channel %s not found", channelName)
+        return
+    }
+
+    presenceChannel.mutex.Lock()
+    defer presenceChannel.mutex.Unlock()
+
+    for client := range presenceChannel.clients {
+        err := client.conn.WriteJSON(message)
+        if err != nil {
+            log.Printf("Error sending message to client %d: %v", client.userID, err)
+            client.conn.Close()
+            delete(presenceChannel.clients, client)
+        }
+    }
+}
+
+
+func broadcastMessageToRedis(channelName string, message map[string]interface{}) {
+    jsonMessage, err := json.Marshal(message)
+    if err != nil {
+        log.Printf("Error marshaling message: %v", err)
+        return
+    }
+
+    err = redisClient.Publish(context.Background(), channelName, jsonMessage).Err()
+    if err != nil {
+        log.Printf("Error publishing message to Redis: %v", err)
+    } else {
+        log.Printf("Message published to Redis channel: %s", channelName)
+    }
+}
+
+
+
 
 // Regenerate api and secret keys
 func regenerateKeysHandler(w http.ResponseWriter, r *http.Request){
@@ -293,32 +429,7 @@ func regenerateKeysHandler(w http.ResponseWriter, r *http.Request){
 	}
 	json.NewEncoder(w).Encode(resp)
 }
-// Check if user has reached the rate limit
-func checkRateLimit(apiKey, userTier string) bool {
-	mutex.Lock()
-	defer mutex.Unlock()
 
-	// Calculate today's date
-	now := time.Now()
-	startOfDay := time.Date(now.Year(), now.Month(), now.Day(), 0, 0, 0, 0, now.Location())
-
-	// Count connections made today
-	var connectionCount int
-	query := "SELECT COUNT(*) FROM connections WHERE api_key=? AND connected_at >= ?"
-	err := db.QueryRow(query, apiKey, startOfDay).Scan(&connectionCount)
-
-	if err != nil {
-		log.Println("Error querying database: ", err)
-		return false
-	}
-
-	limit := rateLimits[userTier]
-	if limit == -1 {
-		return true
-	}
-
-	return connectionCount < limit
-}
 // Middleware for rate limiting
 func rateLimitMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -328,7 +439,7 @@ func rateLimitMiddleware(next http.Handler) http.Handler {
 		// Initialize rate limiter for the API key if not already present
 		rateLimiterMutex.Lock()
 		if _, exists := rateLimiters[apiKey]; !exists {
-			rateLimiters[apiKey] = rate.NewLimiter(1, 5) // 1 request per second, burst if 5
+			rateLimiters[apiKey] = rate.NewLimiter(1, 10) // 1 request per second, burst if 5
 		}
 		limiter := rateLimiters[apiKey]
 		rateLimiterMutex.Unlock()
@@ -336,6 +447,7 @@ func rateLimitMiddleware(next http.Handler) http.Handler {
 		// Check if the request is within the rate limit
 		if !limiter.Allow() {
 			http.Error(w, "Rate limit exceeded", http.StatusTooManyRequests)
+			json.NewEncoder(w).Encode(map[string]string{"message": "Rate limit exceeded"})
 			return
 		}
 
@@ -346,145 +458,206 @@ func rateLimitMiddleware(next http.Handler) http.Handler {
 
 
 // Handle WebSocket connection
-func handleConnections(w http.ResponseWriter, r *http.Request) {	
-	var userID int
-	var userTier string
-	var connectionsToday int
-	var err error
+func handleConnections(w http.ResponseWriter, r *http.Request) {    
+    var userID int
+    var userTier string
+    var connectionsToday int
+    var err error
 
-	// Check for API Keys
-	apiKey := r.Header.Get("X-API-KEY")
-	secretKey := r.Header.Get("X-SECRET-KEY")
+    // Check for API Keys
+    apiKey := r.Header.Get("X-API-KEY")
+    secretKey := r.Header.Get("X-SECRET-KEY")
+    
+    cacheKey := ""
 
-	if apiKey != "" && secretKey != "" {
-		err := db.QueryRow("SELECT id, user_tier, connections_today FROM users WHERE api_key=? AND secret_key=?", apiKey, secretKey).Scan(&userID, &userTier, &connectionsToday)
-		if err != nil {
-			handleAuthError(w, err)
-			return
-		}
-	} else {
-		// Using token
-		token := r.URL.Query().Get("token")
-		if token == "" {
-			http.Error(w, "No authentication provide", http.StatusUnauthorized)
-			return
-		}
-
-		claims, err := validateToken(token)
-		if err != nil {
-			http.Error(w, fmt.Sprintf("Invalid token: %v", err), http.StatusUnauthorized)
-			return
-		}
-
-		userId, ok := claims["user_id"].(float64)
-
-		if !ok {
-			http.Error(w, "Invalid user ID in token ", http.StatusUnauthorized)
-			return
-		}
-
-		userID = int(userId)
-
-		err = db.QueryRow("SELECT user_tier, connections_today FROM users WHERE id = ?", 
-                          userID).Scan(&userTier, &connectionsToday)
-        if err != nil {
-            handleAuthError(w, err)
+    if apiKey != "" && secretKey != "" {
+        cacheKey = "user:" + apiKey + ":" + secretKey
+    } else {
+        // Using token
+        token := r.URL.Query().Get("token")
+        if token == "" {
+            http.Error(w, "No authentication provided", http.StatusUnauthorized)
             return
         }
-	}
 
+        claims, err := validateToken(token)
+        if err != nil {
+            http.Error(w, fmt.Sprintf("Invalid token: %v", err), http.StatusUnauthorized)
+            return
+        }
+
+        userId, ok := claims["user_id"].(float64)
+        if !ok {
+            http.Error(w, "Invalid user ID in token", http.StatusUnauthorized)
+            return
+        }
+
+        userID = int(userId)
+        cacheKey = "user:" + strconv.Itoa(userID)
+    }
+
+    // Check Redis cache
+    cachedData, err := rdb.Get(ctx, cacheKey).Result()
+    if err == redis.Nil {
+        // Cache miss, query the database
+        if apiKey != "" && secretKey != "" {
+            err := db.QueryRow("SELECT id, user_tier, connections_today FROM users WHERE api_key=? AND secret_key=?", apiKey, secretKey).Scan(&userID, &userTier, &connectionsToday)
+            if err != nil {
+                handleAuthError(w, err)
+                return
+            }
+        } else {
+            err = db.QueryRow("SELECT user_tier, connections_today FROM users WHERE id = ?", userID).Scan(&userTier, &connectionsToday)
+            if err != nil {
+                handleAuthError(w, err)
+                return
+            }
+        }
+
+        // Cache the result in Redis
+        userCache := UserCache{
+            UserID:           userID,
+            UserTier:         userTier,
+            ConnectionsToday: connectionsToday,
+        }
+        cacheData, _ := json.Marshal(userCache)
+        err = rdb.Set(ctx, cacheKey, cacheData, time.Minute*10).Err() // Cache for 10 minutes
+        if err != nil {
+            log.Println("Error setting cache: ", err)
+        }
+    } else if err == nil {
+        // Cache hit, use cached data
+        var userCache UserCache
+        err := json.Unmarshal([]byte(cachedData), &userCache)
+        if err != nil {
+            log.Println("Error unmarshalling cache: ", err)
+            http.Error(w, "Internal server error", http.StatusInternalServerError)
+            return
+        }
+        userID = userCache.UserID
+        userTier = userCache.UserTier
+        connectionsToday = userCache.ConnectionsToday
+    } else {
+        log.Println("Error retrieving cache: ", err)
+        http.Error(w, "Internal server error", http.StatusInternalServerError)
+        return
+    }
+
+    // Rate limiting based on user tier
+    maxConnections := 0
+    switch userTier {
+    case "free":
+        maxConnections = 200
+    case "basic":
+        maxConnections = 700
+    case "standard":
+        maxConnections = 1500
+    case "business":
+        maxConnections = -1 // unlimited
+    }
+
+    if maxConnections != -1 && connectionsToday >= maxConnections {
+        http.Error(w, "Rate limit exceeded", http.StatusTooManyRequests)
+		json.NewEncoder(w).Encode(map[string]string{"message": "Rate limit exceeded"})
+        return
+    }
+
+    ws, err := upgrader.Upgrade(w, r, nil)
+    if err != nil {
+        log.Println("Error during WebSocket upgrade:", err)
+        return
+    }
+    defer ws.Close()
+
+    // Increment connectionsToday
+    connectionsToday++
+
+    // Update the users table
+    update := "UPDATE users SET connections_today = ? WHERE id = ?"
+    _, err = db.Exec(update, connectionsToday, userID)
+    if err != nil {
+        log.Println("Error updating connections_today:", err)
+        return
+    }
+
+    // Update the cache with the new connections count
+    userCache := UserCache{
+        UserID:           userID,
+        UserTier:         userTier,
+        ConnectionsToday: connectionsToday,
+    }
+    cacheData, _ := json.Marshal(userCache)
+    err = rdb.Set(ctx, cacheKey, cacheData, time.Minute*5).Err()
+    if err != nil {
+        log.Println("Error updating cache: ", err)
+    }
+
+    // Track the connection in the connections table
+    query := "INSERT INTO connections (user_id) VALUES (?)"
+    _, err = db.Exec(query, userID)
+    if err != nil {
+        log.Println("Error inserting into connections:", err)
+        return
+    }
+
+	idCount++
+	clientID := idCount
+    client := &Client{conn: ws, id: clientID}
+	connectedClient[clientID] = client
 	
 
-	// Rate limiting based on user tier
-	maxConnections := 0
-	switch userTier {
-	case "free":
-		maxConnections = 200
-	case "basic":
-		maxConnections = 700
-	case "standard":
-		maxConnections = 1500
-	case "business":
-		maxConnections = -1 // unlimited
-	}
+    mutex.Lock()
+    // Check if user was previously subscribed
+    if channel, ok := userChannels[clientID]; ok {
+        client.channel = channel
+        subscribeToChannel(client, channel, r)
+    } else {
+        client.channel = ""
+    }
+    // Mark the user as connected
+    clients[client] = true
+    mutex.Unlock()
 
-	if maxConnections != -1 && connectionsToday >= maxConnections {
-		http.Error(w, "Rate limit exceeded", http.StatusTooManyRequests)
-		return
-	}
+    log.Printf("New WebSocket connection established for user %d", userID)
+	
 
-	ws, err := upgrader.Upgrade(w, r, nil)
-	if err != nil {
-		log.Println("Error during WebSocket upgrade:", err)
-		return
-	}
-	defer ws.Close()
+    for {
+        var msg map[string]interface{}
+        err := ws.ReadJSON(&msg)
+        if err != nil {
+            log.Printf("Error reading message: %v", err)
+            break
+        }
+        if action, ok := msg["action"].(string); ok {
+            switch action {
+            case "subscribe":
+                if channelName, ok := msg["channel"].(string); ok {
+                    subscribeToChannel(client, channelName, r)
+                }
+            case "unsubscribe":
+                if channelName, ok := msg["channel"].(string); ok {
+                    unsubscribeFromChannel(client, channelName)
+                }
+            default:
+                fmt.Println("Nothing to do here");
+            }
+        }
+    }
 
-	// Increment connectionsToday
-	connectionsToday++
+    disconnectClient(client)
 
-	// Update the users table
-	update := "UPDATE users SET connections_today = ? WHERE api_key = ?"
-	_, err = db.Exec(update, connectionsToday, apiKey)
-	if err != nil {
-		log.Println("Error updating connections_today:", err)
-		
-		return
-	}
-
-	// Track the connection in the connections table
-	query := "INSERT INTO connections (api_key) VALUES (?)"
-	_, err = db.Exec(query, apiKey)
-	if err != nil {
-		log.Println("Error inserting into connections:", err)
-		return
-	}
-
-
-	client := &Client{conn: ws, userID: userID}
-
-	mutex.Lock()
-	clients[client] = true
-	mutex.Unlock()
-
-	for {
-		var msg map[string]interface{}
-		err := ws.ReadJSON(&msg)
-		if err != nil {
-			log.Printf("Error reading message: %v", err)
-			break
-		}
-		if action, ok := msg["action"].(string); ok && action == "unsubscribe" {
-			if channelName, ok := msg["channel"].(string); ok {
-				unsubscribeFromChannel(client, channelName)
-			}
-		}
-		
-
-		if action, ok := msg["action"].(string); ok && action == "subscribe" {
-			if channelName, ok := msg["channel"].(string); ok {
-				subscribeToChannel(client, channelName, r)
-			}
-			continue
-		}
-
-		if client.channel != "" {
-			broadcastMessage(client.channel, msg)
-		}
-	}
-
-	disconnectClient(client)
-
-	// Clean up 
-	defer func(){
-		query := "DELETE FROM connections WHERE api_key=? ORDER BY connected_at DESC LIMIT 1"
-		_, err := db.Exec(query, apiKey)
-		if err != nil {
-			log.Println("Error deleting connection: ", err)
-		}
-	}()
-
+    // Clean up
+    defer func() {
+        query := "DELETE FROM connections WHERE user_id=? ORDER BY connected_at DESC LIMIT 1"
+		update := "UPDATE users SET user_tier = ? WHERE id =?";
+		db.Exec(update, userTier, userID)
+        _, err := db.Exec(query, userID)
+        if err != nil {
+            log.Println("Error deleting connection: ", err)
+        }
+    }()
 }
+
 
 // Get current connections
 func getCurrentConnections(w http.ResponseWriter, r *http.Request){
@@ -523,7 +696,7 @@ func getConnectedClients(w http.ResponseWriter, r *http.Request){
 	clientList := []string{}
 	channel.mutex.Lock()
 	for client := range channel.clients {
-		clientList = append(clientList, fmt.Sprintf("client %d", client.userID))
+		clientList = append(clientList, fmt.Sprintf("client %d", client.id))
 	}
 
 	channel.mutex.Unlock()
@@ -534,93 +707,81 @@ func getConnectedClients(w http.ResponseWriter, r *http.Request){
 
 // Subscribe a client to a channel
 func subscribeToChannel(client *Client, channelName string, r *http.Request) {
-	mutex.Lock()
-	defer mutex.Unlock()
-	
+    mutex.Lock()
+    defer mutex.Unlock()
+	if currentChannel, ok := userChannels[client.id]; ok && currentChannel == channelName {
+		log.Printf("Already subscribed to this channel with user id %d", userChannels[client.id])
+        return
+    }
+    log.Printf("Subscribing client %d to channel: %s", client.id, channelName)
+    
+    client.channel = channelName
+    userChannels[client.id] = channelName
 
-	if _, ok := channels[channelName]; !ok {
-		channels[channelName] = &PresenceChannel{
-			Channel: Channel{
-				clients:   make(map[*Client]bool),
-				broadcast: make(chan map[string]interface{}),
-				private: false,
-			},
-			presenceUpdates: make(chan map[string]interface{}),
-		}
 
-	}
+    if _, ok := channels[channelName]; !ok {
+        channels[channelName] = &PresenceChannel{
+            Channel: Channel{
+                clients:   make(map[*Client]bool),
+                broadcast: make(chan map[string]interface{}),
+                private:   false,
+            },
+            presenceUpdates: make(chan map[string]interface{}),
+        }
+        go handleRedisMessages(channelName)
+    }
 
-	presenceChannel := channels[channelName]
+    presenceChannel := channels[channelName]
 
-	if presenceChannel.private {
-		_, isValid := validateAPIKey(r)
-		if !isValid {
-			log.Println("Unauthorized access to private channel ", channelName)
-			client.conn.WriteJSON(map[string]interface{}{
-				"error": "Unauthorized access to private channel",
-			})
-			return
-		}
+    if presenceChannel.private {
+        _, isValid := validateAPIKey(r)
+        if !isValid {
+            log.Println("Unauthorized access to private channel ", channelName)
+            client.conn.WriteJSON(map[string]interface{}{
+                "error": "Unauthorized access to private channel",
+            })
+            return
+        }
+    }
 
-	}
-	presenceChannel.mutex.Lock()
-	defer presenceChannel.mutex.Unlock()
+    presenceChannel.mutex.Lock()
+    defer presenceChannel.mutex.Unlock()
 
-	client.channel = channelName
-	presenceChannel.clients[client] = true
+    presenceChannel.clients[client] = true
 
-	presenceUpdate := map[string]interface{}{
-		"event":   "presence_update",
-		"channel": channelName,
-		"clients": len(presenceChannel.clients),
-	}
+    presenceUpdate := map[string]interface{}{
+        "event":   "presence_update",
+        "channel": channelName,
+        "clients": len(presenceChannel.clients),
+    }
+    broadcastMessageToRedis(channelName, presenceUpdate)
 
-	for c := range presenceChannel.clients {
-		err := c.conn.WriteJSON(presenceUpdate)
-		if err != nil {
-			log.Printf("Error sending presence update to client: %v", err)
-			c.conn.Close()
-			disconnectClient(c)
-		}
-	}
-
-	fmt.Printf("Client subscribed to channel: %s\n", channelName)
+    log.Printf("Client %d subscribed to channel: %s\n", client.id, channelName)
 }
+
 
 
 // Unscribe from channel
 func unsubscribeFromChannel(client *Client, channelName string) {
-    channel, exists := channels[channelName]
-    if !exists {
-        return
-    }
+    if channel, ok := channels[channelName]; ok {
+        channel.mutex.Lock()
+        defer channel.mutex.Unlock()
+		client.channel = channelName
+		userChannels[client.id] = ""
+		log.Printf("Already subscribed to this %s", channelName)
+        delete(channel.clients, client)
 
-    channel.mutex.Lock()
-    defer channel.mutex.Unlock()
-
-    // Remove the client from the channel, even if they are not subscribed
-    delete(channel.clients, client)
-
-    // Check if the client is still subscribed to any channels
-    clientStillSubscribed := false
-    for chName := range channels {
-        ch := channels[chName]
-        ch.mutex.Lock()
-        if _, subscribed := ch.clients[client]; subscribed {
-            clientStillSubscribed = true
+        if len(channel.clients) == 0 {
+            log.Printf("No more clients in channel %s. Unsubscribing from Redis.", channelName)
+            delete(clients, client)
         }
-        ch.mutex.Unlock()
 
-        if clientStillSubscribed {
-            break
-        }
-    }
+		log.Printf("Still subscribed to %s?", channelName)
 
-    // If the client is not subscribed to any channels, close their connection
-    if !clientStillSubscribed {
-        client.conn.Close()
+        log.Printf("Client %d unsubscribed from channel: %s", client.id, channelName)
     }
 }
+
 
 
 
@@ -673,50 +834,41 @@ func Broadcast(w http.ResponseWriter, r *http.Request){
 		return
 	}
 
-	
-	broadcastMessage(req.Channel, map[string]interface{}{
-		"event": req.Event,
-		"data":  req.Data,
-	})
+	message := map[string]interface{}{
+        "event": req.Event,
+        "data":  req.Data,
+    }
+	// broadcastMessage(req.Channel, map[string]interface{}{
+	// 	"event": req.Event,
+	// 	"data":  req.Data,
+	// })
+	broadcastMessageToRedis(req.Channel, message)
 
 	w.WriteHeader(http.StatusOK)
 }
 
 // Handle client disconnection
 func disconnectClient(client *Client) {
-	mutex.Lock()
-	defer mutex.Unlock()
+    log.Printf("Client %d disconnected from channel: %s", client.id, client.channel)
 
-	if client.channel != "" {
-		presenceChannel := channels[client.channel]
-		presenceChannel.mutex.Lock()
-		defer presenceChannel.mutex.Unlock()
+    channelName := client.channel
 
-		delete(presenceChannel.clients, client)
+    if channelName != "" {
+        unsubscribeFromChannel(client, channelName)
+    }
 
-		presenceUpdate := map[string]interface{}{
-			"event":   "presence_update",
-			"channel": client.channel,
-			"clients": len(presenceChannel.clients),
-		}
+    // Clean up the client's connection
+    client.conn.Close()
 
-		for c := range presenceChannel.clients {
-			err := c.conn.WriteJSON(presenceUpdate)
-			if err != nil {
-				log.Printf("Error sending presence update to client: %v", err)
-				c.conn.Close()
-				disconnectClient(c)
-			}
-		}
+    // Remove client from the clients map
+    mutex.Lock()
+    delete(clients, client)
+    mutex.Unlock()
 
-		if len(presenceChannel.clients) == 0 {
-			delete(channels, client.channel)
-		}
-	}
-
-	delete(clients, client)
-	fmt.Println("Client disconnected")
+    log.Printf("Client %d fully disconnected", client.id)
 }
+
+
 
 func resetConnectionsDaily(db *sql.DB) {
     ticker := time.NewTicker(24 * time.Hour)
@@ -739,13 +891,18 @@ func resetConnections(db *sql.DB) {
 }
 
 func main() {
+	redisClient = redis.NewClient(&redis.Options{
+        Addr:     "localhost:6379", // Replace with your Redis server address
+        Password: "",               // No password set
+        DB:       0,                // Use default DB
+    })
 	go resetConnectionsDaily(db)
 	initDB()
 	defer db.Close()
 
 
 	r := mux.NewRouter()
-
+	
 
 	r.HandleFunc("/keys", createKeysHandler).Methods("POST")
 	r.HandleFunc("/keys", getKeysHandler).Methods("GET")
@@ -814,4 +971,9 @@ func generateRandomString(n int) string {
 		b[i] = characters[rand.Intn(len(characters))]
 	}
 	return string(b)
+}
+
+func generateUserID() int {
+    rand.Seed(time.Now().UnixNano())
+    return rand.Int()
 }

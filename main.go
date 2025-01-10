@@ -77,7 +77,7 @@ func init() {
 // Mutex for concurrency
 var mutex = sync.Mutex{}
 
-// Client represents a single WebSocket connection
+
 type Client struct {
 	conn    *websocket.Conn
 	channel string
@@ -133,7 +133,7 @@ func initDB(){
 }
 
 func cacheAPIKey(apiKey string, secret string) {
-    // Cache the secret with an expiration time (e.g., 1 hour)
+    // Cache the secret with an expiration time
     err := redisClient.Set(ctx, "api_key:"+apiKey, secret, time.Hour).Err()
     if err != nil {
         log.Printf("Error caching API key: %v", err)
@@ -892,9 +892,9 @@ func resetConnections(db *sql.DB) {
 
 func main() {
 	redisClient = redis.NewClient(&redis.Options{
-        Addr:     "localhost:6379", // Replace with your Redis server address
-        Password: "",               // No password set
-        DB:       0,                // Use default DB
+        Addr:     "localhost:6379",
+        Password: "",               
+        DB:       0,                
     })
 	go resetConnectionsDaily(db)
 	initDB()
